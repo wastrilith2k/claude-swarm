@@ -1,0 +1,134 @@
+services:
+  # Core infrastructure
+  redis:
+    image: redis:7-alpine
+    container_name: mcp_redis
+    ports:
+      - '6379:6379'
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-swarmredis123}
+    command: redis-server --requirepass ${REDIS_PASSWORD:-swarmredis123}
+    healthcheck:
+      test: ['CMD', 'redis-cli', '--raw', 'incr', 'ping']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mcp_team_network
+    volumes:
+      - redis_data:/data
+
+  neo4j:
+    image: neo4j:5.12-community
+    container_name: mcp_neo4j
+    ports:
+      - '7474:7474'
+      - '7687:7687'
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-swarmpassword123}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          "echo 'RETURN 1' | cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-swarmpassword123} || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mcp_team_network
+
+  # Single multi-agent service
+  agent-team:
+    build:
+      context: .
+      dockerfile: agent-team/Dockerfile
+    container_name: mcp_agent_team
+    ports:
+      - '3001:3000'
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-swarmredis123}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-swarmpassword123}
+      - NODE_ENV=${NODE_ENV:-development}
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+    volumes:
+      - ./projects:/app/projects
+      - ./agent-definitions:/app/agents
+      - ./shared:/app/shared
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mcp_team_network
+
+  # Dashboard API Service (Backend)
+  dashboard-api:
+    build:
+      context: .
+      dockerfile: dashboard-api/Dockerfile
+    container_name: mcp_dashboard_api
+    ports:
+      - '3000:3000'
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-swarmpassword123}
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-swarmredis123}
+      - PORT=3000
+      - AGENT_SWARM_URL=http://agent-team:3000
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      agent-team:
+        condition: service_healthy
+    networks:
+      - mcp_team_network
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Dashboard Frontend Service
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: mcp_dashboard_frontend
+    ports:
+      - '8080:80'
+    depends_on:
+      - dashboard-api
+    networks:
+      - mcp_team_network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
+
+networks:
+  mcp_team_network:
+    driver: bridge
