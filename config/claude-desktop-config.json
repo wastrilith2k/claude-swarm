@@ -1,0 +1,67 @@
+{
+  "mcpServers": {
+    "mcp-swarm-architect": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3001/mcp"
+      ],
+      "description": "Lead Architect for project planning and coordination"
+    },
+    "mcp-swarm-frontend": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3002/mcp"
+      ],
+      "description": "Frontend specialist for UI/UX development"
+    },
+    "mcp-swarm-backend": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3003/mcp"
+      ],
+      "description": "Backend specialist for API and database development"
+    },
+    "mcp-swarm-devops": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3004/mcp"
+      ],
+      "description": "DevOps specialist for infrastructure and deployment"
+    },
+    "mcp-swarm-qa": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3005/mcp"
+      ],
+      "description": "QA specialist for testing and quality assurance"
+    },
+    "mcp-swarm-docs": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3006/mcp"
+      ],
+      "description": "Documentation specialist for technical writing"
+    },
+    "mcp-swarm-reviewer": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-stdio",
+        "http://localhost:3007/mcp"
+      ],
+      "description": "Code review specialist for quality and standards enforcement"
+    }
+  }
+}
