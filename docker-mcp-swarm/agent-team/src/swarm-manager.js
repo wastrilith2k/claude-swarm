@@ -68,6 +68,36 @@ export class SwarmManager {
       });
     });
 
+    // Debug endpoint to check active tasks
+    this.app.get('/debug/active-tasks', (req, res) => {
+      const activeTasksMap = {};
+      for (const [agentName, agent] of this.agents) {
+        const activeTasks = this.taskRouter.activeTasksByAgent.get(agentName) || [];
+        activeTasksMap[agentName] = {
+          activeTasks: activeTasks.length,
+          maxConcurrent: agent.maxConcurrentTasks,
+          canAccept: this.taskRouter.canAcceptTask(agent),
+          tasks: activeTasks.map(t => ({ id: t.id, title: t.title, status: t.status }))
+        };
+      }
+      res.json({
+        activeTasksByAgent: activeTasksMap,
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // Force reset active tasks endpoint
+    this.app.post('/debug/reset-active-tasks', (req, res) => {
+      // Clear all active tasks from memory
+      for (const [agentName] of this.agents) {
+        this.taskRouter.activeTasksByAgent.set(agentName, []);
+      }
+      res.json({
+        message: 'Active tasks cleared for all agents',
+        timestamp: new Date().toISOString()
+      });
+    });
+
     // Agent status
     this.app.get('/agents', (req, res) => {
       const agentStatus = Array.from(this.agents.values()).map(agent =>
@@ -303,6 +333,7 @@ export class SwarmManager {
     for (const config of agentConfigs) {
       const agent = new ClaudeAgent(config.name, config);
       agent.registerTools(mcpTools);
+      await agent.initialize(); // Initialize database connections and start polling
       this.agents.set(config.name, agent);
       this.logger.info(`Initialized agent: ${config.name}`);
     }

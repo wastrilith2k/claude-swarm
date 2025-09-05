@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import winston from 'winston';
 import Redis from 'redis';
 import neo4j from 'neo4j-driver';
+import { getToolsForAgent } from './tools/agent-tools.js';
 
 /**
  * Individual Claude Agent with specialized capabilities
@@ -17,7 +18,7 @@ export class ClaudeAgent {
       apiKey: process.env.CLAUDE_API_KEY,
     });
     this.conversationHistory = [];
-    this.availableTools = [];
+    this.availableTools = getToolsForAgent(name); // Load tools for this agent
     this.isProcessingTask = false;
     this.redis = null;
     this.neo4jDriver = null;
@@ -73,7 +74,7 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
       }
 
       const response = await this.anthropic.messages.create({
-        model: 'claude-3-5-sonnet-20241022',
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 4096,
         system: this.systemPrompt,
         messages,
@@ -170,19 +171,21 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
       specialization: this.specialization,
       conversationHistory: this.conversationHistory.length,
       availableTools: this.availableTools.length,
-      status: this.isProcessingTask ? 'busy' : 'idle',
+      status: this.isProcessingTask ? 'active' : 'idle',
+      lastSeen: new Date().toISOString(),
     };
   }
 
   /**
-   * Initialize database connections and start task polling
+   * Initialize database connections 
+   * NOTE: Task polling is handled by TaskRouter, not individual agents
    */
   async initialize() {
     try {
       // Initialize Redis connection
       const redisUrl = process.env.REDIS_URL || 'redis://redis:6379';
       const redisPassword = process.env.REDIS_PASSWORD;
-      
+
       this.redis = Redis.createClient({
         url: redisUrl,
         password: redisPassword,
@@ -201,10 +204,10 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
 
       await this.neo4jDriver.verifyConnectivity();
 
-      // Start task polling
-      this.startTaskPolling();
-      
-      this.logger.info('Agent initialized and task polling started');
+      // NOTE: Individual task polling disabled - TaskRouter handles all polling
+      // this.startTaskPolling();
+
+      this.logger.info('Agent initialized - TaskRouter will handle task polling');
     } catch (error) {
       this.logger.error(`Failed to initialize agent: ${error.message}`);
       throw error;
@@ -219,7 +222,7 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
       if (!this.isProcessingTask) {
         await this.pollForTasks();
       }
-    }, 5000); // Poll every 5 seconds
+    }, 2000); // Poll every 2 seconds for faster responsiveness
   }
 
   /**
@@ -238,15 +241,18 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
   async pollForTasks() {
     try {
       const session = this.neo4jDriver.session();
-      const result = await session.run(`
+      const result = await session.run(
+        `
         MATCH (t:Task)
-        WHERE t.agent = $agentName 
-        AND t.status = 'pending'
+        WHERE (t.assignedTo = $agentName OR t.agent = $agentName)
+        AND t.status IN ['queued', 'assigned']
         RETURN t
         ORDER BY t.priority DESC, t.createdAt ASC
         LIMIT 1
-      `, { agentName: this.name });
-      
+      `,
+        { agentName: this.name }
+      );
+
       await session.close();
 
       if (result.records.length > 0) {
@@ -271,48 +277,87 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
 
     try {
       // Update task status to in_progress
-      await this.updateTaskStatus(task.id, 'in_progress', { startedAt: new Date().toISOString() });
-
-      // Process the task using Claude
-      const result = await this.think(task.description, {
-        taskId: task.id,
-        taskTitle: task.title,
-        taskPriority: task.priority,
+      await this.updateTaskStatus(task.id, 'in_progress', {
+        startedAt: new Date().toISOString(),
       });
 
+      let result;
+
+      // Check if DEBUG_MODE is enabled
+      if (process.env.DEBUG_MODE === 'true') {
+        this.logger.info(
+          `🐛 DEBUG MODE: Simulating task processing for ${task.title}`
+        );
+
+        // Simulate processing time (random 30-300 seconds)
+        const minTime = 30000; // 30 seconds
+        const maxTime = 300000; // 5 minutes
+        const processingTime =
+          Math.floor(Math.random() * (maxTime - minTime + 1)) + minTime;
+
+        this.logger.info(
+          `🐛 DEBUG MODE: Simulating ${(processingTime / 1000 / 60).toFixed(
+            1
+          )} minutes of processing`
+        );
+
+        await new Promise(resolve => setTimeout(resolve, processingTime));
+
+        result = {
+          type: 'text',
+          content: `DEBUG MODE: Task "${task.title}" simulated as completed. This is a placeholder result that would normally come from Claude API processing.`,
+          agent: this.name,
+          timestamp: new Date().toISOString(),
+          debug: true,
+        };
+      } else {
+        // Normal Claude API processing
+        result = await this.think(task.description, {
+          taskId: task.id,
+          taskTitle: task.title,
+          taskPriority: task.priority,
+        });
+      }
+
       // Update task status to completed
-      await this.updateTaskStatus(task.id, 'completed', { 
+      await this.updateTaskStatus(task.id, 'completed', {
         completedAt: new Date().toISOString(),
-        result: JSON.stringify(result)
+        result: JSON.stringify(result),
       });
 
       // Publish completion event
-      await this.redis.publish(`task:${task.id}:status`, JSON.stringify({
-        taskId: task.id,
-        status: 'completed',
-        result: result,
-        agent: this.name,
-        timestamp: new Date().toISOString(),
-      }));
+      await this.redis.publish(
+        `task:${task.id}:status`,
+        JSON.stringify({
+          taskId: task.id,
+          status: 'completed',
+          result: result,
+          agent: this.name,
+          timestamp: new Date().toISOString(),
+        })
+      );
 
       this.logger.info(`Completed task: ${task.title}`);
     } catch (error) {
       this.logger.error(`Task processing error: ${error.message}`);
-      
+
       // Update task status to failed
-      await this.updateTaskStatus(task.id, 'failed', { 
+      await this.updateTaskStatus(task.id, 'failed', {
         failedAt: new Date().toISOString(),
-        error: error.message
-      });
-      
-      // Publish failure event
-      await this.redis.publish(`task:${task.id}:status`, JSON.stringify({
-        taskId: task.id,
-        status: 'failed',
         error: error.message,
-        agent: this.name,
-        timestamp: new Date().toISOString(),
-      }));
+      });
+
+      // Publish failure event
+      await this.redis.publish(
+        `task:${task.id}:status`,
+        JSON.stringify({
+          taskId: task.id,
+          status: 'failed',
+          error: error.message,
+          agent: this.name,
+          timestamp: new Date().toISOString(),
+        })
+      );
     } finally {
       this.isProcessingTask = false;
     }
@@ -333,11 +378,14 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
         params[key] = value;
       }
 
-      await session.run(`
+      await session.run(
+        `
         MATCH (t:Task {id: $taskId})
         ${setClause}
         RETURN t
-      `, params);
+      `,
+        params
+      );
     } finally {
       await session.close();
     }
@@ -356,11 +404,11 @@ Always be helpful, accurate, and collaborative. When you need assistance with ta
    */
   async cleanup() {
     this.stopTaskPolling();
-    
+
     if (this.redis) {
       await this.redis.quit();
     }
-    
+
     if (this.neo4jDriver) {
       await this.neo4jDriver.close();
     }

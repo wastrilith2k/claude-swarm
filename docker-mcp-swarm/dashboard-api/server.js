@@ -90,7 +90,10 @@ class SwarmDashboard {
     // Rate limiting
     const limiter = rateLimit({
       windowMs: 15 * 60 * 1000, // 15 minutes
-      max: 100, // limit each IP to 100 requests per windowMs
+      max: 1000, // limit each IP to 1000 requests per windowMs (increased for development)
+      message: { error: 'Too many requests, please try again later.' },
+      standardHeaders: true,
+      legacyHeaders: false,
     });
     this.app.use('/api/', limiter);
 
@@ -132,7 +135,7 @@ class SwarmDashboard {
 
     this.app.get('/api/tasks/pending', async (req, res) => {
       try {
-        const tasks = await this.getTasksByStatus(['pending', 'assigned']);
+        const tasks = await this.getAllTasks();
         res.json(tasks);
       } catch (error) {
         res.status(500).json({ error: error.message });
@@ -168,7 +171,11 @@ class SwarmDashboard {
 
     this.app.get('/api/tasks/blocked', async (req, res) => {
       try {
-        const tasks = await this.getTasksByStatus(['Blocked']);
+        const tasks = await this.getTasksByStatus([
+          'blocked',
+          'Blocked',
+          'paused',
+        ]);
         res.json(tasks);
       } catch (error) {
         res.status(500).json({ error: error.message });
@@ -228,6 +235,21 @@ class SwarmDashboard {
         res.json(projects);
       } catch (error) {
         res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Create project endpoint
+    this.app.post('/api/projects', async (req, res) => {
+      try {
+        const { name, description } = req.body;
+        const projectId = await this.createProject(name, description);
+        res.json({
+          success: true,
+          projectId,
+          message: 'Project created successfully',
+        });
+      } catch (error) {
+        res.status(400).json({ error: error.message });
       }
     });
 
@@ -307,10 +329,58 @@ class SwarmDashboard {
     this.app.post('/api/tasks/:taskId/:action', async (req, res) => {
       try {
         const { taskId, action } = req.params;
+        console.log(`DEBUG: Task action ${action} for task ${taskId}`);
         await this.handleTaskAction(taskId, action);
         res.json({ success: true, message: `Task ${action} successful` });
       } catch (error) {
-        res.status(400).json({ error: error.message });
+        console.error(
+          `Error handling task action ${req.params.action}:`,
+          error
+        );
+        res.status(400).json({
+          error: `Failed to ${req.params.action} task: ${error.message}`,
+        });
+      }
+    });
+
+    // Get detailed task status including blocking reasons
+    this.app.get('/api/tasks/:taskId/status', async (req, res) => {
+      try {
+        const { taskId } = req.params;
+        const taskStatus = await this.getTaskStatus(taskId);
+        res.json(taskStatus);
+      } catch (error) {
+        res.status(404).json({ error: error.message });
+      }
+    });
+
+    // Get blocking analysis for all blocked tasks
+    this.app.get('/api/tasks/blocking-analysis', async (req, res) => {
+      try {
+        const analysis = await this.getBlockingAnalysis();
+        res.json(analysis);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // System orchestration status - like tmux status but for agent swarm
+    this.app.get('/api/orchestration/status', async (req, res) => {
+      try {
+        const status = await this.getOrchestrationStatus();
+        res.json(status);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Detect and fix stuck tasks
+    this.app.post('/api/orchestration/fix-stuck-tasks', async (req, res) => {
+      try {
+        const result = await this.fixStuckTasks();
+        res.json(result);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
       }
     });
 
@@ -502,20 +572,24 @@ class SwarmDashboard {
   // SIMPLIFIED: Single method to get tasks by status
   async getTasksByStatus(statuses) {
     try {
+      console.log('DEBUG: getTasksByStatus called with:', statuses);
       const session = this.neo4jDriver.session();
-      const result = await session.run(
-        `
+      const query = `
         MATCH (t:Task)
         WHERE t.status IN $statuses
         RETURN t
         ORDER BY t.priority DESC, t.createdAt ASC
         LIMIT 50
-      `,
-        { statuses }
-      );
+      `;
+      console.log('DEBUG: Running query:', query);
+      console.log('DEBUG: With parameters:', { statuses });
+
+      const result = await session.run(query, { statuses });
       await session.close();
 
-      return result.records.map(record => {
+      console.log('DEBUG: Found', result.records.length, 'records');
+
+      const tasks = result.records.map(record => {
         const task = record.get('t').properties;
         // Convert Neo4j types to regular JavaScript types
         Object.keys(task).forEach(key => {
@@ -528,42 +602,11 @@ class SwarmDashboard {
         });
         return task;
       });
+
+      console.log('DEBUG: Returning', tasks.length, 'tasks');
+      return tasks;
     } catch (error) {
       console.error('Error getting tasks by status:', error);
-      return [];
-    }
-  }
-
-  async getTasksByStatus(status) {
-    try {
-      const session = this.neo4jDriver.session();
-      const result = await session.run(
-        `
-        MATCH (t:Task)
-        WHERE t.status = $status
-        RETURN t
-        ORDER BY t.createdAt DESC
-        LIMIT 50
-      `,
-        { status }
-      );
-      await session.close();
-
-      return result.records.map(record => {
-        const task = record.get('t').properties;
-        Object.keys(task).forEach(key => {
-          if (neo4j.isInt(task[key])) {
-            task[key] = task[key].toNumber();
-          }
-          // Convert Neo4j DateTime to ISO string
-          if (neo4j.isDateTime(task[key])) {
-            task[key] = task[key].toString();
-          }
-        });
-        return task;
-      });
-    } catch (error) {
-      console.error(`Error getting ${status} tasks:`, error);
       return [];
     }
   }
@@ -601,11 +644,12 @@ class SwarmDashboard {
   async getProjects() {
     try {
       const session = this.neo4jDriver.session();
+      // Try multiple project patterns
       const result = await session.run(`
-        MATCH (p:Knowledge)
-        WHERE p.type = 'project'
+        MATCH (p)
+        WHERE p.type = 'project' OR labels(p)[0] = 'Project' OR p.name IS NOT NULL
         RETURN p
-        ORDER BY p.createdAt DESC
+        ORDER BY p.createdAt DESC, p.name ASC
         LIMIT 20
       `);
       await session.close();
@@ -613,7 +657,9 @@ class SwarmDashboard {
       return result.records.map(record => {
         const project = record.get('p').properties;
         try {
-          project.data = JSON.parse(project.data);
+          if (project.data && typeof project.data === 'string') {
+            project.data = JSON.parse(project.data);
+          }
         } catch (e) {
           // If parsing fails, keep as string
         }
@@ -623,6 +669,421 @@ class SwarmDashboard {
       console.error('Error getting projects:', error);
       return [];
     }
+  }
+
+  async createProject(name, description) {
+    try {
+      const session = this.neo4jDriver.session();
+      const projectId = `project_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`;
+
+      await session.run(
+        `
+        CREATE (p:Project {
+          id: $projectId,
+          name: $name,
+          description: $description,
+          status: 'active',
+          createdAt: datetime(),
+          updatedAt: datetime(),
+          type: 'user_project'
+        })
+        RETURN p
+        `,
+        { projectId, name, description }
+      );
+
+      await session.close();
+      console.log(`📋 Created project via API: ${name} (${projectId})`);
+      return projectId;
+    } catch (error) {
+      console.error('Error creating project:', error);
+      throw error;
+    }
+  }
+
+  async getTaskStatus(taskId) {
+    const session = this.neo4jDriver.session();
+    try {
+      const result = await session.run(
+        `
+        MATCH (t:Task {id: $taskId})
+        OPTIONAL MATCH (a:Agent)-[:ASSIGNED_TO]->(t)
+        RETURN t, a.name as assignedAgent
+        `,
+        { taskId }
+      );
+
+      if (result.records.length === 0) {
+        throw new Error(`Task ${taskId} not found`);
+      }
+
+      const record = result.records[0];
+      const task = record.get('t').properties;
+      const assignedAgent = record.get('assignedAgent');
+
+      // Convert Neo4j types
+      Object.keys(task).forEach(key => {
+        if (neo4j.isInt(task[key])) {
+          task[key] = task[key].toNumber();
+        }
+        if (neo4j.isDateTime(task[key])) {
+          task[key] = task[key].toString();
+        }
+      });
+
+      // Add blocking analysis
+      let blockingReason = task.blockingReason || '';
+      if (task.status === 'in_progress' && assignedAgent) {
+        // Check if agent is actually processing
+        const timeSinceStart = task.startedAt
+          ? new Date() - new Date(task.startedAt)
+          : 0;
+        if (timeSinceStart > 300000) {
+          // 5 minutes
+          blockingReason = `Task has been in progress for ${Math.round(
+            timeSinceStart / 60000
+          )} minutes without completion`;
+        }
+      }
+
+      return {
+        ...task,
+        assignedAgent,
+        blockingReason,
+        isStuck:
+          blockingReason.includes('in progress for') ||
+          task.status === 'blocked',
+      };
+    } finally {
+      await session.close();
+    }
+  }
+
+  async getBlockingAnalysis() {
+    const session = this.neo4jDriver.session();
+    try {
+      const result = await session.run(`
+        MATCH (t:Task)
+        WHERE t.status IN ['blocked', 'paused']
+           OR (t.status = 'in_progress' AND datetime() > t.startedAt + duration('PT5M'))
+        OPTIONAL MATCH (a:Agent)-[:ASSIGNED_TO]->(t)
+        RETURN t, a.name as assignedAgent
+        ORDER BY t.updatedAt DESC
+      `);
+
+      const blockedTasks = result.records.map(record => {
+        const task = record.get('t').properties;
+        const assignedAgent = record.get('assignedAgent');
+
+        // Convert Neo4j types
+        Object.keys(task).forEach(key => {
+          if (neo4j.isInt(task[key])) {
+            task[key] = task[key].toNumber();
+          }
+          if (neo4j.isDateTime(task[key])) {
+            task[key] = task[key].toString();
+          }
+        });
+
+        let reason = task.blockingReason || '';
+        if (task.status === 'in_progress') {
+          const timeSinceStart = task.startedAt
+            ? new Date() - new Date(task.startedAt)
+            : 0;
+          reason = `Stuck in progress for ${Math.round(
+            timeSinceStart / 60000
+          )} minutes`;
+        } else if (task.status === 'paused') {
+          reason = reason || 'Task manually paused';
+        } else if (task.status === 'blocked') {
+          reason = reason || 'Task blocked - requires attention';
+        }
+
+        return {
+          ...task,
+          assignedAgent,
+          blockingReason: reason,
+          recommendedAction: this.getRecommendedAction(task.status, reason),
+        };
+      });
+
+      return {
+        totalBlocked: blockedTasks.length,
+        tasks: blockedTasks,
+        summary: {
+          paused: blockedTasks.filter(t => t.status === 'paused').length,
+          blocked: blockedTasks.filter(t => t.status === 'blocked').length,
+          stuck: blockedTasks.filter(t => t.status === 'in_progress').length,
+        },
+      };
+    } finally {
+      await session.close();
+    }
+  }
+
+  getRecommendedAction(status, reason) {
+    if (status === 'paused') {
+      return 'Resume task when ready to continue';
+    }
+    if (status === 'blocked') {
+      return 'Review task requirements and unblock';
+    }
+    if (status === 'in_progress' && reason.includes('Stuck')) {
+      return 'Restart task or check agent status';
+    }
+    return 'Review task status and take appropriate action';
+  }
+
+  async getOrchestrationStatus() {
+    const session = this.neo4jDriver.session();
+    try {
+      // Get overall task counts by status
+      const taskStats = await session.run(`
+        MATCH (t:Task)
+        RETURN t.status as status, count(t) as count
+      `);
+
+      const statusCounts = {};
+      taskStats.records.forEach(record => {
+        statusCounts[record.get('status')] = record.get('count').toNumber();
+      });
+
+      // Get agent activity
+      const agents = await this.getAllAgentStatuses();
+
+      // Get recent task activity (last hour)
+      const recentActivity = await session.run(`
+        MATCH (t:Task)
+        WHERE t.updatedAt > datetime() - duration('PT1H')
+        RETURN count(t) as recentTasks
+      `);
+
+      const recentTaskCount = recentActivity.records[0]
+        .get('recentTasks')
+        .toNumber();
+
+      // System health assessment
+      const totalTasks = Object.values(statusCounts).reduce(
+        (sum, count) => sum + count,
+        0
+      );
+      const activeTasks =
+        (statusCounts.in_progress || 0) + (statusCounts.queued || 0);
+      const blockedTasks =
+        (statusCounts.blocked || 0) + (statusCounts.paused || 0);
+
+      const healthScore =
+        totalTasks > 0
+          ? Math.round(((totalTasks - blockedTasks) / totalTasks) * 100)
+          : 100;
+
+      let systemStatus = 'healthy';
+      if (healthScore < 70) systemStatus = 'degraded';
+      if (healthScore < 50) systemStatus = 'critical';
+      if (blockedTasks === totalTasks && totalTasks > 0)
+        systemStatus = 'blocked';
+
+      return {
+        timestamp: new Date().toISOString(),
+        systemStatus,
+        healthScore,
+        debugMode: process.env.DEBUG_MODE === 'true',
+        tasks: {
+          total: totalTasks,
+          active: activeTasks,
+          blocked: blockedTasks,
+          recent: recentTaskCount,
+          byStatus: statusCounts,
+        },
+        agents: {
+          total: Object.keys(agents).length,
+          active: Object.values(agents).filter(a => a.status === 'active')
+            .length,
+          idle: Object.values(agents).filter(a => a.status === 'idle').length,
+        },
+        recommendations: this.getSystemRecommendations(
+          systemStatus,
+          statusCounts,
+          agents
+        ),
+      };
+    } finally {
+      await session.close();
+    }
+  }
+
+  async fixStuckTasks() {
+    const session = this.neo4jDriver.session();
+    try {
+      // Get all agents status first
+      const agents = await this.getAllAgentStatuses();
+      const activeAgents = Object.values(agents).filter(
+        a => a.status === 'active'
+      ).length;
+
+      // Find tasks that are in_progress but no agents are active
+      const stuckTasksQuery = `
+        MATCH (t:Task)
+        WHERE t.status = 'in_progress'
+        RETURN t.id as taskId, t.title as title, t.assignedTo as assignedTo, t.startedAt as startedAt
+      `;
+
+      const stuckTasksResult = await session.run(stuckTasksQuery);
+      const stuckTasks = stuckTasksResult.records.map(record => ({
+        taskId: record.get('taskId'),
+        title: record.get('title'),
+        assignedTo: record.get('assignedTo'),
+        startedAt: record.get('startedAt'),
+      }));
+
+      const results = {
+        timestamp: new Date().toISOString(),
+        activeAgents,
+        stuckTasksFound: stuckTasks.length,
+        stuckTasks: stuckTasks,
+        tasksReset: [],
+      };
+
+      // If no agents are active but tasks are in_progress, reset them
+      if (activeAgents === 0 && stuckTasks.length > 0) {
+        for (const task of stuckTasks) {
+          // Reset task to queued status
+          await session.run(
+            `
+            MATCH (t:Task {id: $taskId})
+            SET t.status = 'queued',
+                t.stuckAt = datetime(),
+                t.stuckReason = 'Reset due to no active agents',
+                t.resetCount = COALESCE(t.resetCount, 0) + 1
+            REMOVE t.startedAt
+            RETURN t
+          `,
+            { taskId: task.taskId }
+          );
+
+          // Publish reset notification
+          await this.redis.publish(
+            `task:${task.taskId}:status`,
+            JSON.stringify({
+              taskId: task.taskId,
+              status: 'queued',
+              action: 'stuck_task_reset',
+              timestamp: new Date().toISOString(),
+              reason: 'Reset due to no active agents',
+            })
+          );
+
+          results.tasksReset.push({
+            taskId: task.taskId,
+            title: task.title,
+            reason: 'No active agents',
+          });
+        }
+      }
+
+      // Also check for tasks stuck for too long (more than 30 minutes)
+      const longStuckQuery = `
+        MATCH (t:Task)
+        WHERE t.status = 'in_progress'
+        AND t.startedAt < datetime() - duration('PT30M')
+        RETURN t.id as taskId, t.title as title, t.assignedTo as assignedTo, t.startedAt as startedAt
+      `;
+
+      const longStuckResult = await session.run(longStuckQuery);
+      const longStuckTasks = longStuckResult.records.map(record => ({
+        taskId: record.get('taskId'),
+        title: record.get('title'),
+        assignedTo: record.get('assignedTo'),
+        startedAt: record.get('startedAt'),
+      }));
+
+      for (const task of longStuckTasks) {
+        await session.run(
+          `
+          MATCH (t:Task {id: $taskId})
+          SET t.status = 'queued',
+              t.stuckAt = datetime(),
+              t.stuckReason = 'Reset due to timeout (30+ minutes)',
+              t.resetCount = COALESCE(t.resetCount, 0) + 1
+          REMOVE t.startedAt
+          RETURN t
+        `,
+          { taskId: task.taskId }
+        );
+
+        await this.redis.publish(
+          `task:${task.taskId}:status`,
+          JSON.stringify({
+            taskId: task.taskId,
+            status: 'queued',
+            action: 'stuck_task_reset',
+            timestamp: new Date().toISOString(),
+            reason: 'Reset due to timeout (30+ minutes)',
+          })
+        );
+
+        results.tasksReset.push({
+          taskId: task.taskId,
+          title: task.title,
+          reason: 'Timeout (30+ minutes)',
+        });
+      }
+
+      return results;
+    } finally {
+      await session.close();
+    }
+  }
+
+  getSystemRecommendations(systemStatus, statusCounts, agents) {
+    const recommendations = [];
+
+    if (statusCounts.blocked > 0) {
+      recommendations.push(`Review ${statusCounts.blocked} blocked task(s)`);
+    }
+
+    if (statusCounts.paused > 0) {
+      recommendations.push(
+        `Consider resuming ${statusCounts.paused} paused task(s)`
+      );
+    }
+
+    if (statusCounts.in_progress > 3) {
+      recommendations.push(
+        'High number of concurrent tasks - monitor for bottlenecks'
+      );
+    }
+
+    if (
+      Object.values(agents).every(a => a.status === 'idle') &&
+      statusCounts.queued > 0
+    ) {
+      recommendations.push(
+        'Agents are idle but tasks are queued - check task routing'
+      );
+    }
+
+    // Check for stuck tasks - in_progress but all agents idle
+    if (
+      Object.values(agents).every(a => a.status === 'idle') &&
+      statusCounts.in_progress > 0
+    ) {
+      recommendations.push(
+        `${statusCounts.in_progress} task(s) stuck in progress - use fix-stuck-tasks endpoint`
+      );
+    }
+
+    if (process.env.DEBUG_MODE === 'true') {
+      recommendations.push('DEBUG MODE: Tasks will auto-complete for testing');
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push('System operating normally');
+    }
+
+    return recommendations;
   }
 
   async getMetrics() {
@@ -815,38 +1276,68 @@ class SwarmDashboard {
     try {
       let status;
       let updateTime = 'updatedAt';
+      let blockingReason = null;
 
       switch (action) {
         case 'start':
         case 'resume':
           status = 'in_progress';
           updateTime = 'startedAt';
+          // Clear any blocking reason when resuming
+          blockingReason = '';
           break;
         case 'pause':
           status = 'paused';
           break;
         case 'stop':
+          status = 'queued'; // Stop should put task back in queue
+          updateTime = 'stoppedAt';
+          break;
         case 'cancel':
-          status = 'cancelled';
+          status = 'cancelled'; // Cancel should permanently cancel
           updateTime = 'cancelledAt';
           break;
         case 'complete':
           status = 'completed';
           updateTime = 'completedAt';
           break;
+        case 'block':
+          status = 'blocked';
+          blockingReason = 'Manual block - requires attention';
+          break;
+        case 'unblock':
+          status = 'queued';
+          blockingReason = '';
+          break;
         default:
           throw new Error(`Unknown action: ${action}`);
       }
 
-      await session.run(
+      console.log(`DEBUG: Updating task ${taskId} to status ${status}`);
+
+      // Build the SET clause dynamically
+      let setClause = `t.status = $status, t.${updateTime} = datetime()`;
+      const params = { taskId, status };
+
+      if (blockingReason !== null) {
+        setClause += ', t.blockingReason = $blockingReason';
+        params.blockingReason = blockingReason;
+      }
+
+      const result = await session.run(
         `
         MATCH (t:Task {id: $taskId})
-        SET t.status = $status,
-            t.${updateTime} = datetime()
+        SET ${setClause}
         RETURN t
         `,
-        { taskId, status }
+        params
       );
+
+      if (result.records.length === 0) {
+        throw new Error(`Task with ID ${taskId} not found`);
+      }
+
+      console.log(`DEBUG: Task ${taskId} updated successfully to ${status}`);
 
       // Publish status update
       await this.redis.publish(
@@ -855,14 +1346,72 @@ class SwarmDashboard {
           taskId,
           status,
           action,
+          blockingReason: blockingReason || undefined,
           timestamp: new Date().toISOString(),
         })
       );
+
+      // If resuming/starting a task in DEBUG_MODE, simulate agent activity
+      if (
+        (action === 'resume' || action === 'start') &&
+        process.env.DEBUG_MODE === 'true'
+      ) {
+        await this.simulateAgentActivity(taskId);
+      }
+    } catch (error) {
+      console.error(`Error in handleTaskAction:`, error);
+      throw error;
     } finally {
       await session.close();
     }
   }
 
+  async simulateAgentActivity(taskId) {
+    // In DEBUG_MODE, simulate agent processing the task
+    const minTime = 30000; // 30 seconds
+    const maxTime = 300000; // 5 minutes
+    const randomDelay =
+      Math.floor(Math.random() * (maxTime - minTime + 1)) + minTime;
+    const delayMinutes = (randomDelay / 60000).toFixed(1);
+
+    console.log(
+      `🐛 DEBUG: Simulating agent activity for task ${taskId} (${delayMinutes} minutes)`
+    );
+
+    setTimeout(async () => {
+      try {
+        const session = this.neo4jDriver.session();
+        await session.run(
+          `
+          MATCH (t:Task {id: $taskId})
+          SET t.status = 'completed',
+              t.completedAt = datetime(),
+              t.result = 'DEBUG MODE: Task simulated as completed'
+          RETURN t
+          `,
+          { taskId }
+        );
+        await session.close();
+
+        // Publish completion update
+        await this.redis.publish(
+          `task:${taskId}:status`,
+          JSON.stringify({
+            taskId,
+            status: 'completed',
+            action: 'auto_complete_debug',
+            timestamp: new Date().toISOString(),
+          })
+        );
+
+        console.log(
+          `🐛 DEBUG: Task ${taskId} auto-completed after ${delayMinutes} minutes`
+        );
+      } catch (error) {
+        console.error(`Error in debug simulation:`, error);
+      }
+    }, randomDelay);
+  }
   async start() {
     const port = process.env.PORT || 3000;
 

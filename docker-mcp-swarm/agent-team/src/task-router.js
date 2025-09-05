@@ -29,13 +29,20 @@ export class TaskRouter {
       this.logger.info('🔧 DEBUG MODE DISABLED - Normal Claude API operations');
     }
 
-    // Initialize tracking for each agent
+    // ROBUST INITIALIZATION - Force clear and reinitialize tracking for each agent
+    console.log('🔄 CONSTRUCTOR: Initializing activeTasksByAgent map...');
+    this.activeTasksByAgent.clear(); // Ensure completely clean start
+    
     for (const [agentName, agent] of this.agents) {
       this.activeTasksByAgent.set(agentName, []);
+      console.log(`✅ CONSTRUCTOR: Initialized ${agentName} with empty task array (max: ${agent.maxConcurrentTasks})`);
     }
+
+    console.log(`✅ CONSTRUCTOR: ${this.activeTasksByAgent.size} agents initialized in activeTasksByAgent map`);
 
     // Start automatic task processing (delay slightly to ensure Neo4j is fully ready)
     setTimeout(() => {
+      console.log('🚀 CONSTRUCTOR: Starting auto-processing...');
       this.startAutoProcessing();
     }, 2000);
   }
@@ -258,7 +265,44 @@ export class TaskRouter {
 
   canAcceptTask(agent) {
     const activeTasks = this.activeTasksByAgent.get(agent.name) || [];
-    return activeTasks.length < agent.maxConcurrentTasks;
+    
+    // HOTFIX: Set maxConcurrentTasks directly based on agent name
+    let maxConcurrent = agent.maxConcurrentTasks;
+    if (!maxConcurrent) {
+      // Map agent names to their max concurrent tasks
+      const agentLimits = {
+        'system-architect': 2,
+        'backend-developer': 3,
+        'frontend-developer': 2,
+        'qa-engineer': 4,
+        'devops-engineer': 3,
+        'code-reviewer': 5,
+        'project-manager': 10
+      };
+      maxConcurrent = agentLimits[agent.name] || 3;
+      console.log(`🔧 HOTFIX: Setting maxConcurrentTasks for ${agent.name} to ${maxConcurrent}`);
+    }
+    
+    const canAccept = activeTasks.length < maxConcurrent;
+    
+    // SIMPLIFIED DEBUG
+    console.log(`🔍 ${agent.name}: ${activeTasks.length}/${maxConcurrent} tasks → ${canAccept ? 'ACCEPT' : 'REJECT'}`);
+    
+    this.logger?.info(
+      `🔍 Agent ${agent.name}: ${activeTasks.length}/${maxConcurrent} tasks, canAccept: ${canAccept}`
+    );
+    
+    if (!canAccept) {
+      this.logger?.error(
+        `❌ Agent ${agent.name} REJECTED: ${activeTasks.length}/${maxConcurrent} tasks. IDs: ${activeTasks.map(t => t.id).join(', ')}`
+      );
+    } else {
+      this.logger?.info(
+        `✅ Agent ${agent.name} ACCEPTED: ${activeTasks.length}/${maxConcurrent} tasks`
+      );
+    }
+    
+    return canAccept;
   }
 
   async assignTask(agent, task) {
@@ -546,6 +590,15 @@ export class TaskRouter {
   startAutoProcessing() {
     if (!this.isAutoProcessingEnabled) return;
 
+    console.log('🚀 STARTING AUTO-PROCESSING...');
+
+    // CRITICAL: Verify activeTasksByAgent state before starting
+    console.log('🔍 PRE-START VERIFICATION:');
+    for (const [agentName] of this.agents) {
+      const tasks = this.activeTasksByAgent.get(agentName) || [];
+      console.log(`   ${agentName}: ${tasks.length} active tasks`);
+    }
+
     // Start Project Manager coordination
     this.startProjectManagerCoordination();
 
@@ -567,10 +620,13 @@ export class TaskRouter {
     // Start consistency checks
     this.startConsistencyChecks();
 
-    // Initial sync on startup
-    setTimeout(async () => {
-      await this.syncTaskState();
-    }, 1000);
+    // IMMEDIATE sync on startup - don't wait
+    console.log('🔄 IMMEDIATE STARTUP SYNC...');
+    this.syncTaskState().then(() => {
+      console.log('✅ STARTUP SYNC COMPLETED');
+    }).catch(err => {
+      console.error('❌ STARTUP SYNC FAILED:', err);
+    });
 
     this.logger?.info(
       'Started automatic task processing with 10-second agent polling and Project Manager coordination'
@@ -793,6 +849,8 @@ export class TaskRouter {
     const session = this.neo4jDriver.session();
 
     try {
+      console.log('\n🔄 STARTING COMPREHENSIVE SYNC...');
+      
       // Get all tasks from Neo4j and sync with in-memory state
       const result = await session.run(`
         MATCH (t:Task)
@@ -806,11 +864,22 @@ export class TaskRouter {
         ORDER BY t.createdAt ASC
       `);
 
-      // Clear current in-memory queues
+      console.log(`📋 Found ${result.records.length} active tasks in Neo4j`);
+
+      // COMPLETE RESET - Clear everything
       this.taskQueue = [];
+      this.activeTasksByAgent.clear(); // Complete clear
+      
+      console.log('🧹 Completely cleared activeTasksByAgent map');
+      
+      // Reinitialize for all agents
       for (const [agentName] of this.agents) {
         this.activeTasksByAgent.set(agentName, []);
+        console.log(`✅ Initialized empty array for agent: ${agentName}`);
       }
+      
+      console.log('🔄 FORCED RESET: Cleared all activeTasksByAgent data');
+      this.logger?.info('🔄 FORCED RESET: Cleared all activeTasksByAgent data');
 
       // Rebuild from Neo4j state
       for (const record of result.records) {
@@ -967,7 +1036,7 @@ export class TaskRouter {
       const result = await session.run(
         `
         MATCH (t:Task)
-        WHERE t.assignedTo = $agentName
+        WHERE (t.assignedTo = $agentName OR t.agent = $agentName)
           AND t.status IN ['queued', 'assigned']
         RETURN t.id as taskId,
                t.title as title,
@@ -975,7 +1044,8 @@ export class TaskRouter {
                t.priority as priority,
                t.status as status,
                t.assignedAt as assignedAt,
-               t.projectId as projectId
+               t.projectId as projectId,
+               t.assignedTo as assignedTo
         ORDER BY t.priority DESC, t.assignedAt ASC
         LIMIT 1
       `,
@@ -1291,6 +1361,7 @@ export class TaskRouter {
             t.description = $description,
             t.status = $status,
             t.assignedTo = $assignedTo,
+            t.agent = $assignedTo,
             t.priority = $priority,
             t.assignedAt = $assignedAt,
             t.completedAt = $completedAt,
@@ -1300,7 +1371,8 @@ export class TaskRouter {
             t.blockingReason = $blockingReason,
             t.nextAction = $nextAction,
             t.debugMode = $debugMode,
-            t.updatedAt = $updatedAt
+            t.updatedAt = $updatedAt,
+            t.createdAt = COALESCE(t.createdAt, datetime())
         `,
         {
           taskId: task.id,
@@ -1351,6 +1423,151 @@ export class TaskRouter {
       } catch (error) {
         this.logger?.error(`Error closing Redis connection: ${error.message}`);
       }
+    }
+  }
+
+  // Project Management Methods
+  async createOrUpdateProject(task) {
+    if (this.debugMode) {
+      console.log(
+        '🐛 DEBUG: Skipping project creation (Claude API call needed)'
+      );
+      return null;
+    }
+
+    const session = this.neo4jDriver.session();
+    try {
+      // Get system-architect to analyze and name the project
+      const architect = this.agents.get('system-architect');
+      if (!architect) {
+        throw new Error('System architect not available for project naming');
+      }
+
+      // Ask architect to analyze the task and suggest a project name
+      const projectAnalysis = await architect.processTask({
+        id: `project_analysis_${Date.now()}`,
+        description: `Analyze this task and suggest a clear, descriptive project name (2-4 words max): "${task.description}"`,
+        type: 'project_naming',
+        context: {
+          originalTask: task.description,
+          requestType: 'project_name_suggestion',
+        },
+      });
+
+      // Extract project name from architect's response
+      let projectName = this.extractProjectName(projectAnalysis.result || '');
+      if (!projectName) {
+        projectName = `Project ${Date.now()}`;
+      }
+
+      // Create or update project in Neo4j
+      const projectId = `project_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`;
+
+      await session.run(
+        `
+        CREATE (p:Project {
+          id: $projectId,
+          name: $projectName,
+          description: $description,
+          status: 'active',
+          createdAt: datetime(),
+          updatedAt: datetime(),
+          type: 'user_project'
+        })
+        WITH p
+        MATCH (t:Task {id: $taskId})
+        SET t.projectId = p.id
+        CREATE (t)-[:BELONGS_TO]->(p)
+        RETURN p
+        `,
+        {
+          projectId,
+          projectName,
+          description: task.description,
+          taskId: task.id,
+        }
+      );
+
+      console.log(`📋 Created project: ${projectName} (${projectId})`);
+      this.logger?.info(`📋 Created project: ${projectName} (${projectId})`);
+
+      // Publish project creation update
+      await this.publishProjectUpdate(projectId, projectName, 'created');
+
+      return { id: projectId, name: projectName };
+    } catch (error) {
+      console.error('Error creating project:', error);
+      this.logger?.error(`Error creating project: ${error.message}`);
+      return null;
+    } finally {
+      await session.close();
+    }
+  }
+
+  extractProjectName(architectResponse) {
+    // Extract project name from architect's response
+    // Look for patterns like "Project Name: X" or just extract the main concept
+    const lines = architectResponse.split('\n');
+
+    for (const line of lines) {
+      // Look for explicit project name suggestions
+      const nameMatch = line.match(/(?:project name|name|title):\s*(.+)/i);
+      if (nameMatch) {
+        return nameMatch[1].trim().replace(/['"]/g, '');
+      }
+    }
+
+    // Fallback: try to extract key concepts from the response
+    const words = architectResponse
+      .split(/\s+/)
+      .filter(word => word.length > 3 && /^[a-zA-Z]+$/.test(word))
+      .slice(0, 3);
+
+    if (words.length > 0) {
+      return words.join(' ');
+    }
+
+    return null;
+  }
+
+  async publishProjectUpdate(projectId, projectName, action) {
+    if (this.redis) {
+      try {
+        await this.redis.publish(
+          'project_updates',
+          JSON.stringify({
+            projectId,
+            projectName,
+            action,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch (error) {
+        console.error('Error publishing project update:', error);
+      }
+    }
+  }
+
+  async updateProjectName(projectId, newName) {
+    const session = this.neo4jDriver.session();
+    try {
+      await session.run(
+        `
+        MATCH (p:Project {id: $projectId})
+        SET p.name = $newName, p.updatedAt = datetime()
+        RETURN p
+        `,
+        { projectId, newName }
+      );
+
+      await this.publishProjectUpdate(projectId, newName, 'renamed');
+      console.log(`📋 Updated project name: ${newName}`);
+    } catch (error) {
+      console.error('Error updating project name:', error);
+    } finally {
+      await session.close();
     }
   }
 }
